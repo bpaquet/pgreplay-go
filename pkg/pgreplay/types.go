@@ -29,9 +29,10 @@ type DatabaseConnConfig struct {
 
 type ExtractedLog struct {
 	Details
-	ActionLog  string
-	Message    string
-	Parameters string
+	ActionLog          string
+	Message            string
+	Parameters         string
+	OriginalDurationMs float64
 }
 
 type LogMessage struct {
@@ -130,6 +131,9 @@ type Item interface {
 	GetSessionID() SessionID
 	GetUser() string
 	GetDatabase() string
+	GetQuery() string
+	GetFingerprint() string
+	GetOriginalDurationMs() float64
 	Handle(context.Context, *pgx.Conn) error
 }
 
@@ -150,29 +154,42 @@ type Connect struct{ Details }
 func (Connect) Handle(context.Context, *pgx.Conn) error {
 	return nil // Database will manage opening connections
 }
+func (Connect) GetQuery() string               { return "" }
+func (Connect) GetFingerprint() string         { return "" }
+func (Connect) GetOriginalDurationMs() float64 { return 0 }
 
 type Disconnect struct{ Details }
 
 func (Disconnect) Handle(ctx context.Context, conn *pgx.Conn) error {
 	return conn.Close(ctx)
 }
+func (Disconnect) GetQuery() string               { return "" }
+func (Disconnect) GetFingerprint() string         { return "" }
+func (Disconnect) GetOriginalDurationMs() float64 { return 0 }
 
 type Statement struct {
 	Details
-	Query string `json:"query"`
+	Query              string  `json:"query"`
+	Fingerprint        string  `json:"fingerprint,omitempty"`
+	OriginalDurationMs float64 `json:"original_duration_ms,omitempty"`
 }
 
 func (s Statement) Handle(ctx context.Context, conn *pgx.Conn) error {
 	_, err := conn.Exec(ctx, s.Query)
 	return err
 }
+func (s Statement) GetQuery() string               { return s.Query }
+func (s Statement) GetFingerprint() string         { return s.Fingerprint }
+func (s Statement) GetOriginalDurationMs() float64 { return s.OriginalDurationMs }
 
 // Execute is parsed and awaiting arguments. It deliberately lacks a Handle method as it
 // shouldn't be possible this statement to have been parsed without a following duration
 // or detail line that bound it.
 type Execute struct {
 	Details
-	Query string `json:"query"`
+	Query              string  `json:"query"`
+	Fingerprint        string  `json:"fingerprint,omitempty"`
+	OriginalDurationMs float64 `json:"original_duration_ms,omitempty"`
 }
 
 func (e Execute) Bind(parameters []interface{}) BoundExecute {
@@ -193,3 +210,6 @@ func (e BoundExecute) Handle(ctx context.Context, conn *pgx.Conn) error {
 	_, err := conn.Exec(ctx, e.Query, e.Parameters...)
 	return err
 }
+func (e BoundExecute) GetQuery() string               { return e.Query }
+func (e BoundExecute) GetFingerprint() string         { return e.Fingerprint }
+func (e BoundExecute) GetOriginalDurationMs() float64 { return e.OriginalDurationMs }

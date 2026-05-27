@@ -16,7 +16,7 @@ var _ = Describe("Item JSON", func() {
 	)
 
 	Context("Statement", func() {
-		var item = Statement{details, "select now()"}
+		var item = Statement{Details: details, Query: "select now()"}
 
 		It("Generates JSON", func() {
 			Expect(ItemMarshalJSON(item)).To(
@@ -36,7 +36,7 @@ var _ = Describe("Item JSON", func() {
 	})
 
 	Context("BoundExecute", func() {
-		var item = BoundExecute{Execute{details, "select $1"}, []interface{}{"hello"}}
+		var item = BoundExecute{Execute{Details: details, Query: "select $1"}, []interface{}{"hello"}}
 
 		It("Generates JSON", func() {
 			Expect(ItemMarshalJSON(item)).To(

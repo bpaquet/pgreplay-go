@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,11 +39,14 @@ const (
 	// MaxLogLineSize denotes the maximum size, in bytes, that we can scan in a single log
 	// line. It is possible to pass really large arrays of parameters to Postgres queries
 	// which is why this has to be so large.
-	MaxLogLineSize           = 10 * 1024 * 1024
-	InitialScannerBufferSize = 10 * 10
+	MaxLogLineSize           = 100 * 1024 * 1024
+	InitialScannerBufferSize = 64 * 1024
 
 	// PostgresTimestampFormat is the Go template format that we expect to find our errlog
 	PostgresTimestampFormat = "2006-01-02 15:04:05.000 MST"
+
+	// PostgresTimestampFormatAuroraNoMS matches Aurora's default %t (no milliseconds).
+	PostgresTimestampFormatAuroraNoMS = "2006-01-02 15:04:05 MST"
 )
 
 // ParserFunc is the standard interface to provide items from a parsing source
@@ -114,12 +118,46 @@ func ParseCsvLog(csvlog io.Reader) (items chan Item, errs chan error, done chan 
 	return
 }
 
+// ParseAuroraErrlog generates a stream of Items from the given Aurora/RDS PostgreSQL
+// errlog. Aurora's default log_line_prefix is "%t:%r:%u@%d:[%p]:", which differs from
+// the pipe-separated format ParseErrlog expects.
+func ParseAuroraErrlog(errlog io.Reader) (items chan Item, errs chan error, done chan error) {
+	unbounds := map[SessionID]*Execute{}
+	loglinebuffer, parsebuffer := make([]byte, InitialScannerBufferSize), make([]byte, InitialScannerBufferSize)
+	scanner := NewLogScanner(errlog, loglinebuffer)
+
+	items, errs, done = make(chan Item, ItemBufferSize), make(chan error), make(chan error)
+
+	go func() {
+		for scanner.Scan() {
+			item, err := ParseAuroraItem(scanner.Text(), unbounds, parsebuffer)
+			if err != nil {
+				logLinesErrorTotal.Inc()
+				errs <- err
+			}
+
+			if item != nil {
+				logLinesParsedTotal.Inc()
+				items <- item
+			}
+		}
+
+		close(items)
+		close(errs)
+
+		done <- scanner.Err()
+		close(done)
+	}()
+
+	return
+}
+
 // ParseErrlog generates a stream of Items from the given PostgreSQL errlog. Log line
 // parsing errors are returned down the errs channel, and we signal having finished our
 // parsing by sending a value down the done channel.
 func ParseErrlog(errlog io.Reader) (items chan Item, errs chan error, done chan error) {
 	unbounds := map[SessionID]*Execute{}
-	loglinebuffer, parsebuffer := make([]byte, MaxLogLineSize), make([]byte, MaxLogLineSize)
+	loglinebuffer, parsebuffer := make([]byte, InitialScannerBufferSize), make([]byte, InitialScannerBufferSize)
 	scanner := NewLogScanner(errlog, loglinebuffer)
 
 	items, errs, done = make(chan Item, ItemBufferSize), make(chan error), make(chan error)
@@ -224,6 +262,89 @@ func ParseCsvItem(logline []string, unbounds map[SessionID]*Execute, buffer []by
 	return parseDetailToItem(extractedLog, ParsedFromCsv, unbounds, buffer)
 }
 
+// auroraLineRegex matches Aurora's default log_line_prefix = "%t:%r:%u@%d:[%p]:".
+// The (?s) flag allows the message capture to span newlines (after the scanner has
+// already unfolded \n\t continuations into \n).
+var auroraLineRegex = regexp.MustCompile(
+	`(?s)^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? \S+):` + // %t
+		`([^:]*):` + // %r — host(port), may be empty for background workers
+		`([^@:]*)@([^:]*):` + // %u@%d
+		`\[(\d+)\]:` + // [%p]
+		`(.*)$`, // message
+)
+
+// auroraDurationPrefixRegex strips the "duration: X.XXX ms  " prefix that Aurora emits
+// when log_statement and log_min_duration_statement are both active. Without this, the
+// existing matchers (e.g. LogStatement) detect the line but RenderQuery — which uses
+// strings.TrimPrefix("LOG:  statement: ", ...) — leaves the duration prefix in the query.
+var auroraDurationPrefixRegex = regexp.MustCompile(
+	`^(LOG:  )duration: (\d+\.\d+) ms  ((?:statement|execute|parse|bind))`,
+)
+
+// fpQueryIDRegex matches the Rails SQL Commenter "query_id:<hash>" tag, which is the
+// app-side fingerprint for an ActiveRecord query template.
+var fpQueryIDRegex = regexp.MustCompile(`query_id:([a-zA-Z0-9]+)`)
+
+// Fingerprint returns the query_id from the SQL Commenter block. Empty string if absent.
+func Fingerprint(sql string) string {
+	if m := fpQueryIDRegex.FindStringSubmatch(sql); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+var durationMsRegex = regexp.MustCompile(`duration: (\d+\.\d+) ms`)
+
+// parseDurationMs extracts the float from a "duration: X.XXX ms" suffix. Returns 0 if no match.
+func parseDurationMs(msg string) float64 {
+	m := durationMsRegex.FindStringSubmatch(msg)
+	if m == nil {
+		return 0
+	}
+	v, _ := strconv.ParseFloat(m[1], 64)
+	return v
+}
+
+// ParseAuroraItem constructs an Item from a single Aurora errlog line (multi-line
+// statements have already been collapsed into one token by NewLogScanner).
+func ParseAuroraItem(logline string, unbounds map[SessionID]*Execute, buffer []byte) (Item, error) {
+	matches := auroraLineRegex.FindStringSubmatch(logline)
+	if matches == nil {
+		return nil, fmt.Errorf("failed to parse log line: '%s'", logline)
+	}
+
+	tsStr, user, database, pid, msg := matches[1], matches[3], matches[4], matches[5], matches[6]
+
+	ts, err := time.Parse(PostgresTimestampFormat, tsStr)
+	if err != nil {
+		ts, err = time.Parse(PostgresTimestampFormatAuroraNoMS, tsStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse log timestamp: '%s': %v", tsStr, err)
+		}
+	}
+
+	var originalDurationMs float64
+	if m := auroraDurationPrefixRegex.FindStringSubmatch(msg); m != nil {
+		originalDurationMs, _ = strconv.ParseFloat(m[2], 64)
+		msg = m[1] + m[3] + msg[len(m[0]):]
+	}
+
+	extractedLog := ExtractedLog{
+		Details: Details{
+			Timestamp: ts,
+			SessionID: SessionID(pid),
+			User:      user,
+			Database:  database,
+		},
+		ActionLog:          "",
+		Message:            msg,
+		Parameters:         "",
+		OriginalDurationMs: originalDurationMs,
+	}
+
+	return parseDetailToItem(extractedLog, ParsedFromErrLog, unbounds, buffer)
+}
+
 // ParseItem constructs a Item from Postgres errlogs. The format we accept is
 // log_line_prefix='%m|%u|%d|%c|', so we can split by | to discover each component.
 //
@@ -267,6 +388,9 @@ func parseDetailToItem(el ExtractedLog, parsedFrom string, unbounds map[SessionI
 	if LogDuration.Match(el.Message, parsedFrom) {
 		if unbound, ok := unbounds[el.SessionID]; ok {
 			delete(unbounds, el.SessionID)
+			if dur := parseDurationMs(el.Message); dur > 0 && unbound.OriginalDurationMs == 0 {
+				unbound.OriginalDurationMs = dur
+			}
 			return unbound.Bind(nil), nil
 		}
 
@@ -275,7 +399,13 @@ func parseDetailToItem(el ExtractedLog, parsedFrom string, unbounds map[SessionI
 
 	// LOG:  statement: select pg_reload_conf();
 	if LogStatement.Match(el.Message, parsedFrom) {
-		return Statement{el.Details, LogStatement.RenderQuery(el.Message, parsedFrom)}, nil
+		query := LogStatement.RenderQuery(el.Message, parsedFrom)
+		return Statement{
+			Details:            el.Details,
+			Query:              query,
+			Fingerprint:        Fingerprint(query),
+			OriginalDurationMs: el.OriginalDurationMs,
+		}, nil
 	}
 
 	// LOG:  execute <unnamed>: select pg_sleep($1)
@@ -285,6 +415,12 @@ func parseDetailToItem(el ExtractedLog, parsedFrom string, unbounds map[SessionI
 	// statement has been executed.
 	if LogExtendedProtocolExecute.Match(el.Message, parsedFrom) {
 		query := LogExtendedProtocolExecute.RenderQuery(el.Message, parsedFrom)
+		exec := Execute{
+			Details:            el.Details,
+			Query:              query,
+			Fingerprint:        Fingerprint(query),
+			OriginalDurationMs: el.OriginalDurationMs,
+		}
 
 		if parsedFrom == ParsedFromCsv {
 			params, err := ParseBindParameters(LogExtendedProtocolParameters.RenderQuery(el.Parameters, parsedFrom), buff)
@@ -292,10 +428,10 @@ func parseDetailToItem(el ExtractedLog, parsedFrom string, unbounds map[SessionI
 				return nil, fmt.Errorf("[UnNamedExecute]: failed to parse bind parameters: %s", err.Error())
 			}
 
-			return Execute{el.Details, query}.Bind(params), nil
+			return exec.Bind(params), nil
 		}
 
-		unbounds[el.SessionID] = &Execute{el.Details, query}
+		unbounds[el.SessionID] = &exec
 
 		return nil, nil
 	}
@@ -309,7 +445,12 @@ func parseDetailToItem(el ExtractedLog, parsedFrom string, unbounds map[SessionI
 				return nil, fmt.Errorf("[NamedExecute]: failed to parse bind parameters: %s", err.Error())
 			}
 
-			return Execute{el.Details, query}.Bind(params), nil
+			return Execute{
+				Details:            el.Details,
+				Query:              query,
+				Fingerprint:        Fingerprint(query),
+				OriginalDurationMs: el.OriginalDurationMs,
+			}.Bind(params), nil
 		}
 
 		query := strings.SplitN(
@@ -321,7 +462,12 @@ func parseDetailToItem(el ExtractedLog, parsedFrom string, unbounds map[SessionI
 		// statements instead. If this parse signature allowed us to return arbitrary items
 		// then we'd be able to create an initial prepare statement followed by a matching
 		// execute, but we can hold off doing this until it becomes a problem.
-		unbounds[el.SessionID] = &Execute{el.Details, query}
+		unbounds[el.SessionID] = &Execute{
+			Details:            el.Details,
+			Query:              query,
+			Fingerprint:        Fingerprint(query),
+			OriginalDurationMs: el.OriginalDurationMs,
+		}
 
 		return nil, nil
 	}
